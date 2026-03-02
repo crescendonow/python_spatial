@@ -1,0 +1,7 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+geopandas==0.14.3
+shapely==2.0.2
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+geoalchemy2==0.14.3
