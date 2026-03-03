@@ -5,15 +5,12 @@ import os
 
 app = FastAPI()
 
-# 1. จัดการ Database URL อัตโนมัติ (เปลี่ยน postgres:// เป็น postgresql://)
 DATABASE_URL = os.getenv("DATABASE_URL", "Not Set")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# สร้างการเชื่อมต่อฐานข้อมูล
 engine = create_engine(DATABASE_URL)
 
-# 2. กำหนดโครงสร้างข้อมูลที่รับเข้ามาจาก Go API
 class GeometryPayload(BaseModel):
     type: str
     coordinates: list[float]
@@ -22,24 +19,30 @@ class GeometryPayload(BaseModel):
 def health_check():
     return {"status": "Python Spatial Processor is running"}
 
-# 3. Endpoint สำหรับทำ Snap ไปติดท่อประปา
 @app.post("/snap")
 def snap_geometry(payload: GeometryPayload):
     try:
         lng, lat = payload.coordinates
         
-        # คำสั่ง SQL สุดทรงพลังของ PostGIS ในการหาจุดที่ใกล้ที่สุดบนเส้นท่อประปา
+        # ปรับแก้ SQL: ให้แปลงพิกัด 4326 เป็น SRID เดียวกับเส้นท่อก่อนทำ Spatial Search
+        # วิธีนี้จะทำให้ใช้ GIST Index ได้เต็มประสิทธิภาพ และไม่เกิด Error Mixed SRID
         query = text("""
-            WITH closest_pipe AS (
+            WITH target_point AS (
+                SELECT ST_Transform(
+                    ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), 
+                    (SELECT ST_SRID(wkb_geometry) FROM chonburi.b5531011_pipe LIMIT 1)
+                ) AS geom
+            ),
+            closest_pipe AS (
                 SELECT wkb_geometry 
-                FROM chonburi.b5531011_pipe 
-                ORDER BY wkb_geometry <-> ST_SetSRID(ST_MakePoint(:lng, :lat), 4326) 
+                FROM chonburi.b5531011_pipe, target_point
+                ORDER BY wkb_geometry <-> target_point.geom 
                 LIMIT 1
             )
             SELECT 
-                ST_X(ST_ClosestPoint(wkb_geometry, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326))) AS snap_lng,
-                ST_Y(ST_ClosestPoint(wkb_geometry, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326))) AS snap_lat
-            FROM closest_pipe;
+                ST_X(ST_Transform(ST_ClosestPoint(closest_pipe.wkb_geometry, target_point.geom), 4326)) AS snap_lng,
+                ST_Y(ST_Transform(ST_ClosestPoint(closest_pipe.wkb_geometry, target_point.geom), 4326)) AS snap_lat
+            FROM closest_pipe, target_point;
         """)
         
         with engine.connect() as conn:
@@ -47,7 +50,7 @@ def snap_geometry(payload: GeometryPayload):
             
             if result:
                 return {
-                    "original": payload.dict(),
+                    "original": {"type": payload.type, "coordinates": payload.coordinates},
                     "snapped": {
                         "type": "Point",
                         "coordinates": [result.snap_lng, result.snap_lat]
@@ -57,4 +60,6 @@ def snap_geometry(payload: GeometryPayload):
                 raise HTTPException(status_code=404, detail="No pipes found")
                 
     except Exception as e:
+        # พิมพ์ Error ออกทาง Console เพื่อให้เราไปเช็คใน Railway ได้
+        print(f"❌ Python Snap Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
